@@ -175,22 +175,47 @@ router.post('/projects', requireAuth, async (req: Request, res: Response) => {
   }
 
   const supabase = getAuthedSupabase(r)
-  const { data, error } = await supabase
+  const projectId = randomUUID()
+  const createdAt = new Date().toISOString()
+  const { error } = await supabase
     .from('projects')
     .insert({
+      id: projectId,
       created_by: r.auth.userId,
       name: parsed.data.name,
       description: parsed.data.description || null,
     })
-    .select('*')
-    .single()
 
   if (error) {
     res.status(400).json({ success: false, error: error.message })
     return
   }
 
-  res.status(201).json({ success: true, project: data })
+  const service = createSupabaseService()
+  const { error: memberError } = await service.from('project_members').upsert(
+    {
+      project_id: projectId,
+      user_id: r.auth.userId,
+      project_role: 'admin',
+    },
+    { onConflict: 'project_id,user_id', ignoreDuplicates: true },
+  )
+
+  if (memberError) {
+    res.status(500).json({ success: false, error: memberError.message })
+    return
+  }
+
+  res.status(201).json({
+    success: true,
+    project: {
+      id: projectId,
+      name: parsed.data.name,
+      description: parsed.data.description || null,
+      status: 'active',
+      created_at: createdAt,
+    },
+  })
 })
 
 router.get('/projects/:projectId', requireAuth, async (req: Request, res: Response) => {
