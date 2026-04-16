@@ -2,6 +2,7 @@
 import AppShell from '@/components/AppShell.vue'
 import ToastHost from '@/components/ToastHost.vue'
 import { apiFetch, apiFetchForm } from '@/lib/api'
+import { useAuthStore } from '@/stores/auth'
 import { useToastStore } from '@/stores/toast'
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
@@ -31,6 +32,18 @@ type TimeEntry = {
 }
 type DocumentItem = { id: string; filename: string; storage_path: string; task_id: string | null; created_at: string }
 type EmailLog = { id: string; to_email: string; subject: string; body_preview: string; sent_at: string }
+type Invitation = {
+  id: string
+  invited_email: string
+  project_role: 'admin' | 'member'
+  token: string
+  created_at: string
+  expires_at: string
+  accepted_at: string | null
+  accepted_by: string | null
+  revoked_at: string | null
+  created_by: string
+}
 type TaskStatus = Task['status']
 type TaskPriority = Task['priority']
 
@@ -47,6 +60,7 @@ const PRIORITIES: Array<{ value: TaskPriority; label: string }> = [
   { value: 'high', label: 'Alta' },
 ]
 
+const auth = useAuthStore()
 const toast = useToastStore()
 const route = useRoute()
 const projectId = computed(() => route.params.projectId as string)
@@ -57,8 +71,9 @@ const members = ref<Member[]>([])
 const timeEntries = ref<TimeEntry[]>([])
 const documents = ref<DocumentItem[]>([])
 const emails = ref<EmailLog[]>([])
+const invitations = ref<Invitation[]>([])
 
-const tab = ref<'tasks' | 'time' | 'docs' | 'emails'>('tasks')
+const tab = ref<'tasks' | 'time' | 'docs' | 'emails' | 'members'>('tasks')
 const taskView = ref<'list' | 'kanban'>('kanban')
 const selectedTaskId = ref('')
 
@@ -71,6 +86,8 @@ const taskStatus = ref<TaskStatus>('todo')
 const taskPriority = ref<TaskPriority>('medium')
 const taskDueDate = ref('')
 const selectedAssigneeUserIds = ref<string[]>([])
+const notifyAssignees = ref(false)
+const assigneeNote = ref('')
 
 const timeDate = ref(new Date().toISOString().slice(0, 10))
 const timeMinutes = ref(30)
@@ -84,6 +101,10 @@ const emailSubject = ref('')
 const emailBody = ref('')
 const emailTaskId = ref('')
 
+const inviteEmail = ref('')
+const inviteRole = ref<'admin' | 'member'>('member')
+const inviteNote = ref('')
+
 const selectedTask = computed(() => tasks.value.find((task) => task.id === selectedTaskId.value) || null)
 const taskColumns = computed(() =>
   TASK_STATUSES.map((column) => ({
@@ -94,7 +115,7 @@ const taskColumns = computed(() =>
 
 const applyRouteContext = () => {
   const qTab = route.query.tab
-  if (qTab === 'tasks' || qTab === 'time' || qTab === 'docs' || qTab === 'emails') {
+  if (qTab === 'tasks' || qTab === 'time' || qTab === 'docs' || qTab === 'emails' || qTab === 'members') {
     tab.value = qTab
   }
 
@@ -102,7 +123,7 @@ const applyRouteContext = () => {
   selectedTaskId.value = typeof qTaskId === 'string' ? qTaskId : ''
 }
 
-const setTab = (nextTab: 'tasks' | 'time' | 'docs' | 'emails') => {
+const setTab = (nextTab: 'tasks' | 'time' | 'docs' | 'emails' | 'members') => {
   tab.value = nextTab
 }
 
@@ -112,6 +133,9 @@ const displayPerson = (person: Assignee | Member) => person.fullName || `Usuario
 const formatAssignees = (task: Task) => task.assignees.map(displayPerson).join(', ')
 const isOverdue = (dueDate: string | null) => Boolean(dueDate && dueDate < new Date().toISOString().slice(0, 10))
 const totalTaskCount = computed(() => tasks.value.length)
+const myUserId = computed(() => auth.session?.user?.id || '')
+const myProjectRole = computed(() => members.value.find((m) => m.userId === myUserId.value)?.projectRole || 'member')
+const canAdmin = computed(() => myProjectRole.value === 'admin')
 
 const syncTaskForm = (task: Task | null) => {
   if (!task) {
@@ -121,6 +145,8 @@ const syncTaskForm = (task: Task | null) => {
     taskPriority.value = 'medium'
     taskDueDate.value = ''
     selectedAssigneeUserIds.value = []
+    notifyAssignees.value = false
+    assigneeNote.value = ''
     return
   }
 
@@ -130,6 +156,8 @@ const syncTaskForm = (task: Task | null) => {
   taskPriority.value = task.priority
   taskDueDate.value = task.due_date || ''
   selectedAssigneeUserIds.value = task.assignees.map((item) => item.userId)
+  notifyAssignees.value = false
+  assigneeNote.value = ''
 }
 
 const scrollToSelectedTask = async () => {
@@ -155,6 +183,19 @@ const loadMembers = async () => {
   }
 }
 
+const loadInvitations = async () => {
+  if (!canAdmin.value) {
+    invitations.value = []
+    return
+  }
+  try {
+    const r = await apiFetch<{ success: boolean; invitations: Invitation[] }>(`/api/projects/${projectId.value}/invitations`)
+    invitations.value = r.invitations
+  } catch (e: any) {
+    toast.push({ tone: 'error', title: 'No se pudieron cargar invitaciones', message: e?.message })
+  }
+}
+
 const loadAll = async () => {
   try {
     const p = await apiFetch<{ success: boolean; project: Project }>(`/api/projects/${projectId.value}`)
@@ -163,7 +204,8 @@ const loadAll = async () => {
     toast.push({ tone: 'error', title: 'No se pudo cargar el proyecto', message: e?.message })
   }
 
-  await Promise.all([loadMembers(), loadTasks(), loadTime(), loadDocs(), loadEmails()])
+  await loadMembers()
+  await Promise.all([loadInvitations(), loadTasks(), loadTime(), loadDocs(), loadEmails()])
 }
 
 const loadTasks = async () => {
@@ -255,7 +297,11 @@ const saveAssignees = async () => {
   try {
     const r = await apiFetch<{ success: boolean; assignees: Assignee[] }>(`/api/tasks/${selectedTask.value.id}/assignees`, {
       method: 'PUT',
-      body: JSON.stringify({ assigneeUserIds: selectedAssigneeUserIds.value }),
+      body: JSON.stringify({
+        assigneeUserIds: selectedAssigneeUserIds.value,
+        notify: notifyAssignees.value,
+        note: assigneeNote.value,
+      }),
     })
     tasks.value = tasks.value.map((task) =>
       task.id === selectedTask.value?.id
@@ -265,9 +311,106 @@ const saveAssignees = async () => {
           }
         : task,
     )
+    notifyAssignees.value = false
+    assigneeNote.value = ''
     toast.push({ tone: 'success', title: 'Asignaciones guardadas' })
   } catch (e: any) {
     toast.push({ tone: 'error', title: 'No se pudieron guardar asignaciones', message: e?.message })
+  }
+}
+
+const inviteLink = (inv: Invitation) => `${window.location.origin}/invite?token=${encodeURIComponent(inv.token)}`
+const isExpiredInvite = (inv: Invitation) => new Date(inv.expires_at).getTime() <= Date.now()
+const inviteStatus = (inv: Invitation) => {
+  if (inv.revoked_at) return 'Revocada'
+  if (inv.accepted_at) return 'Aceptada'
+  if (isExpiredInvite(inv)) return 'Expirada'
+  return 'Pendiente'
+}
+
+const copyInviteLink = async (inv: Invitation) => {
+  const link = inviteLink(inv)
+  try {
+    await navigator.clipboard.writeText(link)
+    toast.push({ tone: 'success', title: 'Link copiado' })
+  } catch {
+    toast.push({ tone: 'error', title: 'No se pudo copiar', message: link })
+  }
+}
+
+const createInvitation = async () => {
+  if (!canAdmin.value) return
+  const email = inviteEmail.value.trim()
+  if (!email || !email.includes('@')) return
+  try {
+    const r = await apiFetch<{ success: boolean; invitation: Invitation }>(`/api/projects/${projectId.value}/invitations`, {
+      method: 'POST',
+      body: JSON.stringify({
+        email,
+        projectRole: inviteRole.value,
+        note: inviteNote.value.trim(),
+      }),
+    })
+    invitations.value = [r.invitation, ...invitations.value]
+    inviteEmail.value = ''
+    inviteRole.value = 'member'
+    inviteNote.value = ''
+    toast.push({ tone: 'success', title: 'Invitación enviada' })
+  } catch (e: any) {
+    toast.push({ tone: 'error', title: 'No se pudo invitar', message: e?.message })
+  }
+}
+
+const resendInvitation = async (inv: Invitation) => {
+  if (!canAdmin.value) return
+  try {
+    await apiFetch<{ success: boolean }>(`/api/projects/${projectId.value}/invitations/${inv.id}/resend`, { method: 'POST' })
+    toast.push({ tone: 'success', title: 'Invitación reenviada' })
+  } catch (e: any) {
+    toast.push({ tone: 'error', title: 'No se pudo reenviar', message: e?.message })
+  }
+}
+
+const revokeInvitation = async (inv: Invitation) => {
+  if (!canAdmin.value) return
+  if (!window.confirm(`¿Revocar invitación para ${inv.invited_email}?`)) return
+  try {
+    await apiFetch<{ success: boolean }>(`/api/projects/${projectId.value}/invitations/${inv.id}`, { method: 'DELETE' })
+    invitations.value = invitations.value.map((x) => (x.id === inv.id ? { ...x, revoked_at: new Date().toISOString() } : x))
+    toast.push({ tone: 'success', title: 'Invitación revocada' })
+  } catch (e: any) {
+    toast.push({ tone: 'error', title: 'No se pudo revocar', message: e?.message })
+  }
+}
+
+const updateMemberRole = async (userId: string, projectRole: 'admin' | 'member') => {
+  if (!canAdmin.value) return
+  try {
+    const r = await apiFetch<{ success: boolean; member: { userId: string; projectRole: 'admin' | 'member' } }>(
+      `/api/projects/${projectId.value}/members/${userId}`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({ projectRole }),
+      },
+    )
+    members.value = members.value.map((m) => (m.userId === userId ? { ...m, projectRole: r.member.projectRole } : m))
+    toast.push({ tone: 'success', title: 'Rol actualizado' })
+  } catch (e: any) {
+    toast.push({ tone: 'error', title: 'No se pudo actualizar rol', message: e?.message })
+  }
+}
+
+const removeMember = async (userId: string) => {
+  if (!canAdmin.value) return
+  const member = members.value.find((m) => m.userId === userId)
+  if (!member) return
+  if (!window.confirm(`¿Eliminar a ${displayPerson(member)} del proyecto?`)) return
+  try {
+    await apiFetch<{ success: boolean }>(`/api/projects/${projectId.value}/members/${userId}`, { method: 'DELETE' })
+    members.value = members.value.filter((m) => m.userId !== userId)
+    toast.push({ tone: 'success', title: 'Miembro eliminado' })
+  } catch (e: any) {
+    toast.push({ tone: 'error', title: 'No se pudo eliminar', message: e?.message })
   }
 }
 
@@ -441,11 +584,214 @@ onMounted(loadAll)
         </button>
         <button
           class="ui-btn-outline px-3 py-2 text-sm"
+          :class="tab === 'members' ? 'bg-slate-900/5 text-slate-900 dark:bg-white/5 dark:text-slate-100' : ''"
+          @click="setTab('members')"
+        >
+          Miembros
+        </button>
+        <button
+          class="ui-btn-outline px-3 py-2 text-sm"
           :class="tab === 'emails' ? 'bg-slate-900/5 text-slate-900 dark:bg-white/5 dark:text-slate-100' : ''"
           @click="setTab('emails')"
         >
           Correos
         </button>
+      </div>
+    </div>
+
+    <div
+      v-if="tab === 'members'"
+      class="mt-6 space-y-4"
+    >
+      <div class="grid grid-cols-1 gap-4 xl:grid-cols-2">
+        <div class="ui-card-muted p-4">
+          <div class="text-sm font-semibold text-slate-900 dark:text-slate-100">
+            Invitar
+          </div>
+          <div class="mt-1 text-xs text-slate-600 dark:text-slate-200/70">
+            Enviar invitación por correo (requiere SMTP).
+          </div>
+
+          <div
+            v-if="!canAdmin"
+            class="mt-4 rounded-xl border border-dashed border-slate-300 px-4 py-4 text-sm text-slate-500 dark:border-slate-700 dark:text-slate-300/70"
+          >
+            Solo los administradores pueden invitar.
+          </div>
+
+          <div
+            v-else
+            class="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-4"
+          >
+            <input
+              v-model="inviteEmail"
+              class="ui-input sm:col-span-2"
+              placeholder="email@dominio.com"
+            >
+            <select
+              v-model="inviteRole"
+              class="ui-select"
+            >
+              <option value="member">
+                Miembro
+              </option>
+              <option value="admin">
+                Admin
+              </option>
+            </select>
+            <button
+              class="ui-btn-primary h-10"
+              :disabled="inviteEmail.trim().length < 5"
+              @click="createInvitation"
+            >
+              Enviar
+            </button>
+            <textarea
+              v-model="inviteNote"
+              rows="3"
+              class="ui-textarea sm:col-span-4"
+              placeholder="Mensaje opcional"
+            />
+          </div>
+        </div>
+
+        <div class="ui-card-muted p-4">
+          <div class="text-sm font-semibold text-slate-900 dark:text-slate-100">
+            Miembros
+          </div>
+          <div class="mt-1 text-xs text-slate-600 dark:text-slate-200/70">
+            Roles y acceso al proyecto.
+          </div>
+
+          <div
+            v-if="members.length === 0"
+            class="mt-4 rounded-xl border border-dashed border-slate-300 px-4 py-5 text-sm text-slate-500 dark:border-slate-700 dark:text-slate-300/70"
+          >
+            Sin miembros cargados.
+          </div>
+
+          <div
+            v-else
+            class="mt-4 divide-y divide-slate-200 dark:divide-slate-800"
+          >
+            <div
+              v-for="m in members"
+              :key="m.userId"
+              class="flex flex-wrap items-center justify-between gap-3 py-3"
+            >
+              <div class="min-w-0">
+                <div class="truncate text-sm font-semibold text-slate-900 dark:text-slate-100">
+                  {{ displayPerson(m) }}
+                </div>
+                <div class="mt-1 text-xs text-slate-600 dark:text-slate-200/70">
+                  {{ m.userId.slice(0, 8) }} · {{ new Date(m.createdAt).toLocaleString() }}
+                </div>
+              </div>
+              <div class="flex items-center gap-2">
+                <select
+                  class="ui-select h-9 w-32"
+                  :disabled="!canAdmin"
+                  :value="m.projectRole"
+                  @change="
+                    updateMemberRole(m.userId, ($event.target as HTMLSelectElement).value as 'admin' | 'member')
+                  "
+                >
+                  <option value="member">
+                    Miembro
+                  </option>
+                  <option value="admin">
+                    Admin
+                  </option>
+                </select>
+                <button
+                  class="ui-btn-outline px-3 py-2 text-xs"
+                  :disabled="!canAdmin || m.userId === myUserId"
+                  @click="removeMember(m.userId)"
+                >
+                  Quitar
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="ui-card-muted">
+        <div class="flex items-center justify-between gap-3 px-4 py-3">
+          <div>
+            <div class="text-sm font-semibold text-slate-900 dark:text-slate-100">
+              Invitaciones
+            </div>
+            <div class="mt-1 text-xs text-slate-600 dark:text-slate-200/70">
+              Pendientes, aceptadas o revocadas.
+            </div>
+          </div>
+          <button
+            class="ui-btn-outline px-3 py-2 text-xs"
+            :disabled="!canAdmin"
+            @click="loadInvitations"
+          >
+            Recargar
+          </button>
+        </div>
+
+        <div
+          v-if="!canAdmin"
+          class="px-4 pb-4 text-sm text-slate-600 dark:text-slate-200/70"
+        >
+          Solo los administradores pueden ver invitaciones.
+        </div>
+
+        <div
+          v-else-if="invitations.length === 0"
+          class="px-4 pb-4 text-sm text-slate-600 dark:text-slate-200/70"
+        >
+          Sin invitaciones.
+        </div>
+
+        <div
+          v-else
+          class="divide-y divide-slate-200 dark:divide-slate-800"
+        >
+          <div
+            v-for="inv in invitations"
+            :key="inv.id"
+            class="flex flex-col gap-3 px-4 py-4 lg:flex-row lg:items-center lg:justify-between"
+          >
+            <div class="min-w-0">
+              <div class="truncate text-sm font-semibold text-slate-900 dark:text-slate-100">
+                {{ inv.invited_email }}
+              </div>
+              <div class="mt-1 flex flex-wrap gap-2 text-xs text-slate-600 dark:text-slate-200/70">
+                <span class="ui-pill">{{ inv.project_role }}</span>
+                <span class="ui-pill">{{ inviteStatus(inv) }}</span>
+                <span class="ui-pill">Vence {{ new Date(inv.expires_at).toISOString().slice(0, 10) }}</span>
+              </div>
+            </div>
+            <div class="flex flex-wrap gap-2">
+              <button
+                class="ui-btn-outline px-3 py-2 text-xs"
+                @click="copyInviteLink(inv)"
+              >
+                Copiar link
+              </button>
+              <button
+                class="ui-btn-outline px-3 py-2 text-xs"
+                :disabled="Boolean(inv.accepted_at) || Boolean(inv.revoked_at) || isExpiredInvite(inv)"
+                @click="resendInvitation(inv)"
+              >
+                Reenviar
+              </button>
+              <button
+                class="ui-btn-outline px-3 py-2 text-xs"
+                :disabled="Boolean(inv.accepted_at) || Boolean(inv.revoked_at)"
+                @click="revokeInvitation(inv)"
+              >
+                Revocar
+              </button>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -725,6 +1071,30 @@ onMounted(loadAll)
                   <span>{{ displayPerson(member) }}</span>
                   <span class="text-xs uppercase tracking-wide opacity-70">{{ member.projectRole }}</span>
                 </button>
+              </div>
+            </div>
+
+            <div class="rounded-xl border border-slate-200 bg-white px-3 py-3 dark:border-slate-800 dark:bg-slate-950">
+              <label class="flex items-center justify-between gap-3 text-sm text-slate-700 dark:text-slate-200">
+                <span>Notificar por correo</span>
+                <input
+                  v-model="notifyAssignees"
+                  type="checkbox"
+                  class="h-4 w-4 accent-blue-600"
+                >
+              </label>
+              <textarea
+                v-if="notifyAssignees"
+                v-model="assigneeNote"
+                rows="3"
+                class="ui-textarea mt-3"
+                placeholder="Mensaje opcional para la notificación"
+              />
+              <div
+                v-if="notifyAssignees"
+                class="mt-2 text-xs text-slate-600 dark:text-slate-200/70"
+              >
+                Se enviará correo solo a los nuevos asignados (requiere SMTP).
               </div>
             </div>
 

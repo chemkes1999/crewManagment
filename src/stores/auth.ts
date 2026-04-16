@@ -63,6 +63,14 @@ export const useAuthStore = defineStore('auth', {
         },
       })
     },
+    async signInWithEmailOtp(email: string, redirectTo?: string) {
+      await supabase.auth.signInWithOtp({
+        email,
+        options: {
+          emailRedirectTo: redirectTo || `${window.location.origin}/login`,
+        },
+      })
+    },
     async signOut() {
       await supabase.auth.signOut()
       this.session = null

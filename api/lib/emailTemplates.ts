@@ -12,6 +12,14 @@ type TaskDetails = {
   due_date: string | null
 }
 
+type InvitationDetails = {
+  projectName: string
+  invitedByName?: string | null
+  projectRole: 'admin' | 'member'
+  note?: string
+  url: string
+}
+
 const escapeHtml = (value: string) =>
   value
     .replace(/&/g, '&amp;')
@@ -188,6 +196,79 @@ export const buildTaskAssignmentEmail = (input: {
     `Prioridad: ${input.task.priority}`,
     `Estado: ${input.task.status}`,
     `Vence: ${input.task.due_date || '—'}`,
+    input.note ? `Mensaje: ${input.note}` : undefined,
+    `Enlace: ${input.url}`,
+  ]
+    .filter(Boolean)
+    .join('\n\n')
+
+  return { text, html }
+}
+
+export const buildProjectInvitationEmail = (input: InvitationDetails): EmailContent => {
+  const safeProject = escapeHtml(input.projectName)
+  const safeInvitedBy = input.invitedByName ? escapeHtml(input.invitedByName) : ''
+  const safeRole = input.projectRole === 'admin' ? 'Administrador' : 'Miembro'
+  const safeUrl = escapeHtml(input.url)
+  const safeNote = input.note ? toParagraphs(input.note) : ''
+
+  const html = `<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Invitación a proyecto</title>
+  </head>
+  <body style="margin:0;padding:0;background:#0b1220;">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#0b1220;">
+      <tr>
+        <td align="center" style="padding:26px 12px;">
+          <table role="presentation" width="620" cellspacing="0" cellpadding="0" style="width:100%;max-width:620px;border-radius:20px;overflow:hidden;background:#0f172a;border:1px solid #1f2937;">
+            <tr>
+              <td style="padding:22px 22px 14px 22px;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;color:#e5e7eb;">
+                <div style="font-size:12px;letter-spacing:0.12em;text-transform:uppercase;color:#94a3b8;">${safeProject}</div>
+                <div style="margin-top:10px;font-size:20px;font-weight:750;line-height:26px;">Invitación al proyecto</div>
+                <div style="margin-top:10px;font-size:13px;line-height:19px;color:#cbd5e1;">
+                  ${
+                    safeInvitedBy
+                      ? `${safeInvitedBy} te invitó a unirte como <b style="color:#e5e7eb;">${safeRole}</b>.`
+                      : `Te invitaron a unirte como <b style="color:#e5e7eb;">${safeRole}</b>.`
+                  }
+                </div>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:0 22px 18px 22px;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;color:#e5e7eb;">
+                ${
+                  safeNote
+                    ? `<div style="margin-top:2px;font-size:13px;color:#94a3b8;">Mensaje:</div>
+                       <div style="margin-top:8px;font-size:13px;line-height:19px;color:#cbd5e1;border-left:2px solid #334155;padding-left:12px;">${safeNote}</div>
+                       <div style="height:16px"></div>`
+                    : '<div style="height:6px"></div>'
+                }
+                <table role="presentation" cellspacing="0" cellpadding="0">
+                  <tr>
+                    <td align="center" style="border-radius:12px;background:#2563eb;">
+                      <a href="${safeUrl}" style="display:inline-block;padding:12px 16px;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;font-size:14px;font-weight:700;color:#ffffff;text-decoration:none;">Aceptar invitación</a>
+                    </td>
+                  </tr>
+                </table>
+                <div style="margin-top:12px;font-size:12px;line-height:18px;color:#94a3b8;">Si el botón no funciona, abre este enlace:</div>
+                <div style="margin-top:6px;"><a href="${safeUrl}" style="font-size:12px;color:#60a5fa;word-break:break-all;">${safeUrl}</a></div>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>`
+
+  const text = [
+    `Proyecto: ${input.projectName}`,
+    'Invitación al proyecto',
+    input.invitedByName ? `Invitado por: ${input.invitedByName}` : undefined,
+    `Rol: ${safeRole}`,
     input.note ? `Mensaje: ${input.note}` : undefined,
     `Enlace: ${input.url}`,
   ]

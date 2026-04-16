@@ -4,7 +4,7 @@ import multer from 'multer'
 import nodemailer from 'nodemailer'
 import { z } from 'zod'
 import { getAuthedSupabase, requireAuth, type AuthenticatedRequest } from '../lib/auth.js'
-import { buildGenericEmail, buildTaskAssignmentEmail, getAppBaseUrl } from '../lib/emailTemplates.js'
+import { buildGenericEmail, buildProjectInvitationEmail, buildTaskAssignmentEmail, getAppBaseUrl } from '../lib/emailTemplates.js'
 import { getOptionalEnv } from '../lib/env.js'
 import { createSupabaseService } from '../lib/supabase.js'
 
@@ -28,6 +28,25 @@ async function loadProfilesMap(userIds: string[]) {
   const { data } = await service.from('profiles').select('id, full_name, avatar_url').in('id', uniqueIds)
   const rows = (data || []) as ProfileRow[]
   return new Map(rows.map((row) => [row.id, row]))
+}
+
+function getSmtpConfig() {
+  const smtpHost = getOptionalEnv('SMTP_HOST')
+  const smtpPort = getOptionalEnv('SMTP_PORT')
+  const smtpUser = getOptionalEnv('SMTP_USER')
+  const smtpPass = getOptionalEnv('SMTP_PASS')
+  const smtpFrom = getOptionalEnv('SMTP_FROM')
+  if (!smtpHost || !smtpPort || !smtpUser || !smtpPass || !smtpFrom) return null
+  return { smtpHost, smtpPort, smtpUser, smtpPass, smtpFrom }
+}
+
+function createTransporter(config: NonNullable<ReturnType<typeof getSmtpConfig>>) {
+  return nodemailer.createTransport({
+    host: config.smtpHost,
+    port: Number(config.smtpPort),
+    secure: Number(config.smtpPort) === 465,
+    auth: { user: config.smtpUser, pass: config.smtpPass },
+  })
 }
 
 const createProjectSchema = z.object({
@@ -265,6 +284,309 @@ router.get('/projects/:projectId/members', requireAuth, async (req: Request, res
   res.json({ success: true, members: items })
 })
 
+const updateMemberRoleSchema = z.object({
+  projectRole: z.enum(['admin', 'member']),
+})
+
+router.patch('/projects/:projectId/members/:userId', requireAuth, async (req: Request, res: Response) => {
+  const r = req as AuthenticatedRequest
+  const parsed = updateMemberRoleSchema.safeParse(req.body)
+  if (!parsed.success) {
+    res.status(400).json({ success: false, error: 'Invalid payload' })
+    return
+  }
+
+  const supabase = getAuthedSupabase(r)
+  const { projectId, userId } = req.params
+
+  const { data: targetRow, error: targetError } = await supabase
+    .from('project_members')
+    .select('user_id, project_role')
+    .eq('project_id', projectId)
+    .eq('user_id', userId)
+    .single()
+
+  if (targetError || !targetRow) {
+    res.status(404).json({ success: false, error: 'Member not found' })
+    return
+  }
+
+  if (targetRow.project_role === 'admin' && parsed.data.projectRole !== 'admin') {
+    const { data: admins } = await supabase
+      .from('project_members')
+      .select('user_id')
+      .eq('project_id', projectId)
+      .eq('project_role', 'admin')
+
+    const adminCount = (admins || []).length
+    if (adminCount <= 1 && (admins || []).some((x: any) => x.user_id === userId)) {
+      res.status(400).json({ success: false, error: 'Cannot remove last admin' })
+      return
+    }
+  }
+
+  const { data, error } = await supabase
+    .from('project_members')
+    .update({ project_role: parsed.data.projectRole })
+    .eq('project_id', projectId)
+    .eq('user_id', userId)
+    .select('user_id, project_role')
+    .single()
+
+  if (error) {
+    res.status(400).json({ success: false, error: error.message })
+    return
+  }
+
+  res.json({ success: true, member: { userId: data.user_id, projectRole: data.project_role } })
+})
+
+router.delete('/projects/:projectId/members/:userId', requireAuth, async (req: Request, res: Response) => {
+  const r = req as AuthenticatedRequest
+  const supabase = getAuthedSupabase(r)
+  const { projectId, userId } = req.params
+
+  const { data: targetRow, error: targetError } = await supabase
+    .from('project_members')
+    .select('user_id, project_role')
+    .eq('project_id', projectId)
+    .eq('user_id', userId)
+    .single()
+
+  if (targetError || !targetRow) {
+    res.status(404).json({ success: false, error: 'Member not found' })
+    return
+  }
+
+  if (targetRow.project_role === 'admin') {
+    const { data: admins } = await supabase
+      .from('project_members')
+      .select('user_id')
+      .eq('project_id', projectId)
+      .eq('project_role', 'admin')
+
+    const adminCount = (admins || []).length
+    if (adminCount <= 1 && (admins || []).some((x: any) => x.user_id === userId)) {
+      res.status(400).json({ success: false, error: 'Cannot remove last admin' })
+      return
+    }
+  }
+
+  const { error } = await supabase.from('project_members').delete().eq('project_id', projectId).eq('user_id', userId)
+  if (error) {
+    res.status(400).json({ success: false, error: error.message })
+    return
+  }
+
+  res.json({ success: true })
+})
+
+const createInvitationSchema = z.object({
+  email: z.string().email(),
+  projectRole: z.enum(['admin', 'member']).default('member'),
+  expiresInDays: z.number().int().min(1).max(60).optional(),
+  note: z.string().max(800).optional().or(z.literal('')),
+})
+
+router.get('/projects/:projectId/invitations', requireAuth, async (req: Request, res: Response) => {
+  const r = req as AuthenticatedRequest
+  const supabase = getAuthedSupabase(r)
+  const { projectId } = req.params
+
+  const { data, error } = await supabase
+    .from('project_invitations')
+    .select('id, invited_email, project_role, token, created_at, expires_at, accepted_at, accepted_by, revoked_at, created_by')
+    .eq('project_id', projectId)
+    .order('created_at', { ascending: false })
+
+  if (error) {
+    res.status(400).json({ success: false, error: error.message })
+    return
+  }
+
+  res.json({ success: true, invitations: data || [] })
+})
+
+router.post('/projects/:projectId/invitations', requireAuth, async (req: Request, res: Response) => {
+  const r = req as AuthenticatedRequest
+  const parsed = createInvitationSchema.safeParse(req.body)
+  if (!parsed.success) {
+    res.status(400).json({ success: false, error: 'Invalid payload' })
+    return
+  }
+
+  const smtpConfig = getSmtpConfig()
+  if (!smtpConfig) {
+    res.status(501).json({ success: false, error: 'SMTP not configured' })
+    return
+  }
+
+  const supabase = getAuthedSupabase(r)
+  const { projectId } = req.params
+
+  const [{ data: project }, { data: inviterProfile }] = await Promise.all([
+    supabase.from('projects').select('id,name').eq('id', projectId).single(),
+    supabase.from('profiles').select('full_name').eq('id', r.auth.userId).maybeSingle(),
+  ])
+
+  if (!project) {
+    res.status(404).json({ success: false, error: 'Project not found' })
+    return
+  }
+
+  const baseUrl = getAppBaseUrl(req)
+  const token = randomUUID()
+  const expiresInDays = parsed.data.expiresInDays ?? 7
+  const expiresAt = new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000).toISOString()
+  const invitedEmail = parsed.data.email.trim().toLowerCase()
+  const note = parsed.data.note?.trim() || ''
+
+  const { data, error } = await supabase
+    .from('project_invitations')
+    .insert({
+      project_id: projectId,
+      invited_email: invitedEmail,
+      project_role: parsed.data.projectRole,
+      token,
+      created_by: r.auth.userId,
+      expires_at: expiresAt,
+    })
+    .select('id, invited_email, project_role, token, created_at, expires_at, accepted_at, accepted_by, revoked_at, created_by')
+    .single()
+
+  if (error) {
+    res.status(400).json({ success: false, error: error.message })
+    return
+  }
+
+  const url = `${baseUrl}/invite?token=${encodeURIComponent(token)}`
+  const emailContent = buildProjectInvitationEmail({
+    projectName: project.name,
+    invitedByName: inviterProfile?.full_name || null,
+    projectRole: parsed.data.projectRole,
+    note,
+    url,
+  })
+
+  const transporter = createTransporter(smtpConfig)
+  const subject = `Invitación a ${project.name}`
+  await transporter.sendMail({
+    from: smtpConfig.smtpFrom,
+    to: invitedEmail,
+    subject,
+    text: emailContent.text,
+    html: emailContent.html,
+  })
+
+  const preview = `Invitación a ${project.name}`.slice(0, 200)
+  await supabase.from('email_logs').insert({
+    project_id: projectId,
+    task_id: null,
+    to_email: invitedEmail,
+    subject,
+    body_preview: preview,
+    sent_by: r.auth.userId,
+  })
+
+  res.status(201).json({ success: true, invitation: data })
+})
+
+router.post('/projects/:projectId/invitations/:invitationId/resend', requireAuth, async (req: Request, res: Response) => {
+  const r = req as AuthenticatedRequest
+  const smtpConfig = getSmtpConfig()
+  if (!smtpConfig) {
+    res.status(501).json({ success: false, error: 'SMTP not configured' })
+    return
+  }
+
+  const supabase = getAuthedSupabase(r)
+  const { projectId, invitationId } = req.params
+
+  const [{ data: project }, { data: invitation }, { data: inviterProfile }] = await Promise.all([
+    supabase.from('projects').select('id,name').eq('id', projectId).single(),
+    supabase
+      .from('project_invitations')
+      .select('id, invited_email, project_role, token, expires_at, accepted_at, revoked_at')
+      .eq('project_id', projectId)
+      .eq('id', invitationId)
+      .single(),
+    supabase.from('profiles').select('full_name').eq('id', r.auth.userId).maybeSingle(),
+  ])
+
+  if (!project || !invitation) {
+    res.status(404).json({ success: false, error: 'Invitation not found' })
+    return
+  }
+
+  if (invitation.revoked_at || invitation.accepted_at) {
+    res.status(400).json({ success: false, error: 'Invitation not active' })
+    return
+  }
+
+  if (new Date(invitation.expires_at).getTime() <= Date.now()) {
+    res.status(400).json({ success: false, error: 'Invitation expired' })
+    return
+  }
+
+  const baseUrl = getAppBaseUrl(req)
+  const url = `${baseUrl}/invite?token=${encodeURIComponent(invitation.token)}`
+  const emailContent = buildProjectInvitationEmail({
+    projectName: project.name,
+    invitedByName: inviterProfile?.full_name || null,
+    projectRole: invitation.project_role,
+    url,
+  })
+
+  const transporter = createTransporter(smtpConfig)
+  const subject = `Invitación a ${project.name}`
+  await transporter.sendMail({
+    from: smtpConfig.smtpFrom,
+    to: invitation.invited_email,
+    subject,
+    text: emailContent.text,
+    html: emailContent.html,
+  })
+
+  const preview = `Invitación a ${project.name}`.slice(0, 200)
+  await supabase.from('email_logs').insert({
+    project_id: projectId,
+    task_id: null,
+    to_email: invitation.invited_email,
+    subject,
+    body_preview: preview,
+    sent_by: r.auth.userId,
+  })
+
+  res.json({ success: true })
+})
+
+router.delete('/projects/:projectId/invitations/:invitationId', requireAuth, async (req: Request, res: Response) => {
+  const r = req as AuthenticatedRequest
+  const supabase = getAuthedSupabase(r)
+  const { projectId, invitationId } = req.params
+
+  const { data, error } = await supabase
+    .from('project_invitations')
+    .update({ revoked_at: new Date().toISOString() })
+    .eq('project_id', projectId)
+    .eq('id', invitationId)
+    .is('accepted_at', null)
+    .select('id')
+    .maybeSingle()
+
+  if (error) {
+    res.status(400).json({ success: false, error: error.message })
+    return
+  }
+
+  if (!data) {
+    res.status(404).json({ success: false, error: 'Invitation not found' })
+    return
+  }
+
+  res.json({ success: true })
+})
+
 const createTaskSchema = z.object({
   title: z.string().min(2).max(120),
   description: z.string().max(2000).optional().or(z.literal('')),
@@ -392,6 +714,8 @@ router.patch('/tasks/:taskId', requireAuth, async (req: Request, res: Response) 
 
 const replaceTaskAssigneesSchema = z.object({
   assigneeUserIds: z.array(z.string().uuid()).max(20),
+  notify: z.boolean().optional(),
+  note: z.string().max(800).optional().or(z.literal('')),
 })
 
 router.put('/tasks/:taskId/assignees', requireAuth, async (req: Request, res: Response) => {
@@ -404,11 +728,35 @@ router.put('/tasks/:taskId/assignees', requireAuth, async (req: Request, res: Re
 
   const supabase = getAuthedSupabase(r)
   const { taskId } = req.params
-  const { data: task, error: taskError } = await supabase.from('tasks').select('id, project_id').eq('id', taskId).single()
+  const { data: task, error: taskError } = await supabase
+    .from('tasks')
+    .select('id, project_id, title, description, priority, status, due_date')
+    .eq('id', taskId)
+    .single()
   if (taskError || !task) {
     res.status(404).json({ success: false, error: 'Task not found' })
     return
   }
+
+  const notify = Boolean(parsed.data.notify)
+  const note = parsed.data.note?.trim() || ''
+  const smtpConfig = notify ? getSmtpConfig() : null
+  if (notify && !smtpConfig) {
+    res.status(501).json({ success: false, error: 'SMTP not configured' })
+    return
+  }
+
+  const { data: existingAssignees, error: existingError } = await supabase
+    .from('task_assignees')
+    .select('user_id')
+    .eq('task_id', taskId)
+
+  if (existingError) {
+    res.status(400).json({ success: false, error: existingError.message })
+    return
+  }
+
+  const previousUserIds = [...new Set((existingAssignees || []).map((x: any) => x.user_id).filter(Boolean))]
 
   const userIds = [...new Set(parsed.data.assigneeUserIds)]
   if (userIds.length > 0) {
@@ -449,6 +797,52 @@ router.put('/tasks/:taskId/assignees', requireAuth, async (req: Request, res: Re
     }
   }
 
+  const newAssignees = userIds.filter((id) => !previousUserIds.includes(id))
+
+  if (notify && newAssignees.length > 0 && smtpConfig) {
+    const [{ data: project }] = await Promise.all([
+      supabase.from('projects').select('name').eq('id', task.project_id).single(),
+    ])
+
+    const baseUrl = getAppBaseUrl(req)
+    const url = `${baseUrl}/projects/${task.project_id}?tab=tasks&taskId=${encodeURIComponent(taskId)}`
+
+    const service = createSupabaseService()
+    const transporter = createTransporter(smtpConfig)
+
+    for (const userId of newAssignees) {
+      const { data: userData, error: userError } = await service.auth.admin.getUserById(userId)
+      if (userError || !userData?.user?.email) continue
+
+      const toEmail = userData.user.email.toLowerCase()
+      const subject = `Nueva tarea asignada: ${task.title}`
+      const emailContent = buildTaskAssignmentEmail({
+        projectName: project?.name || 'Proyecto',
+        task,
+        note,
+        url,
+      })
+
+      await transporter.sendMail({
+        from: smtpConfig.smtpFrom,
+        to: toEmail,
+        subject,
+        text: emailContent.text,
+        html: emailContent.html,
+      })
+
+      const preview = `${task.title} — ${note}`.slice(0, 200)
+      await supabase.from('email_logs').insert({
+        project_id: task.project_id,
+        task_id: taskId,
+        to_email: toEmail,
+        subject,
+        body_preview: preview,
+        sent_by: r.auth.userId,
+      })
+    }
+  }
+
   const profileMap = await loadProfilesMap(userIds)
   res.json({
     success: true,
@@ -461,6 +855,76 @@ router.put('/tasks/:taskId/assignees', requireAuth, async (req: Request, res: Re
       }
     }),
   })
+})
+
+const acceptInvitationSchema = z.object({
+  token: z.string().uuid(),
+})
+
+router.post('/invitations/accept', requireAuth, async (req: Request, res: Response) => {
+  const r = req as AuthenticatedRequest
+  const parsed = acceptInvitationSchema.safeParse(req.body)
+  if (!parsed.success) {
+    res.status(400).json({ success: false, error: 'Invalid payload' })
+    return
+  }
+
+  const supabase = getAuthedSupabase(r)
+  const { data: authData, error: authError } = await supabase.auth.getUser()
+  if (authError || !authData.user?.email) {
+    res.status(401).json({ success: false, error: 'Invalid session' })
+    return
+  }
+
+  const userEmail = authData.user.email.trim().toLowerCase()
+  const service = createSupabaseService()
+
+  const { data: invitation, error } = await service
+    .from('project_invitations')
+    .select('id, project_id, invited_email, project_role, expires_at, accepted_at, revoked_at')
+    .eq('token', parsed.data.token)
+    .single()
+
+  if (error || !invitation) {
+    res.status(404).json({ success: false, error: 'Invitation not found' })
+    return
+  }
+
+  if (invitation.revoked_at || invitation.accepted_at) {
+    res.status(400).json({ success: false, error: 'Invitation not active' })
+    return
+  }
+
+  if (new Date(invitation.expires_at).getTime() <= Date.now()) {
+    res.status(400).json({ success: false, error: 'Invitation expired' })
+    return
+  }
+
+  if (String(invitation.invited_email || '').trim().toLowerCase() !== userEmail) {
+    res.status(403).json({ success: false, error: 'Invitation email mismatch' })
+    return
+  }
+
+  const { error: upsertError } = await service.from('project_members').upsert(
+    {
+      project_id: invitation.project_id,
+      user_id: r.auth.userId,
+      project_role: invitation.project_role,
+    },
+    { onConflict: 'project_id,user_id', ignoreDuplicates: true },
+  )
+
+  if (upsertError) {
+    res.status(400).json({ success: false, error: upsertError.message })
+    return
+  }
+
+  await service
+    .from('project_invitations')
+    .update({ accepted_by: r.auth.userId, accepted_at: new Date().toISOString() })
+    .eq('id', invitation.id)
+
+  res.json({ success: true, projectId: invitation.project_id })
 })
 
 router.get('/time-entries', requireAuth, async (req: Request, res: Response) => {
@@ -651,12 +1115,8 @@ router.post('/projects/:projectId/emails/send', requireAuth, async (req: Request
     return
   }
 
-  const smtpHost = getOptionalEnv('SMTP_HOST')
-  const smtpPort = getOptionalEnv('SMTP_PORT')
-  const smtpUser = getOptionalEnv('SMTP_USER')
-  const smtpPass = getOptionalEnv('SMTP_PASS')
-  const smtpFrom = getOptionalEnv('SMTP_FROM')
-  if (!smtpHost || !smtpPort || !smtpUser || !smtpPass || !smtpFrom) {
+  const smtpConfig = getSmtpConfig()
+  if (!smtpConfig) {
     res.status(501).json({
       success: false,
       error: 'SMTP not configured',
@@ -673,12 +1133,7 @@ router.post('/projects/:projectId/emails/send', requireAuth, async (req: Request
     return
   }
 
-  const transporter = nodemailer.createTransport({
-    host: smtpHost,
-    port: Number(smtpPort),
-    secure: Number(smtpPort) === 465,
-    auth: { user: smtpUser, pass: smtpPass },
-  })
+  const transporter = createTransporter(smtpConfig)
 
   const baseUrl = getAppBaseUrl(req)
   const bodyNote = parsed.data.body
@@ -712,7 +1167,7 @@ router.post('/projects/:projectId/emails/send', requireAuth, async (req: Request
   }
 
   await transporter.sendMail({
-    from: smtpFrom,
+    from: smtpConfig.smtpFrom,
     to: parsed.data.to,
     subject: parsed.data.subject,
     text: emailContent.text,

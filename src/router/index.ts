@@ -1,4 +1,5 @@
 import DashboardPage from '@/pages/DashboardPage.vue'
+import InviteAcceptPage from '@/pages/InviteAcceptPage.vue'
 import LoginPage from '@/pages/LoginPage.vue'
 import ProjectPage from '@/pages/ProjectPage.vue'
 import TeamsTimePage from '@/pages/TeamsTimePage.vue'
@@ -17,6 +18,11 @@ const routes: RouteRecordRaw[] = [
     path: '/login',
     name: 'login',
     component: LoginPage,
+  },
+  {
+    path: '/invite',
+    name: 'invite',
+    component: InviteAcceptPage,
   },
   {
     path: '/projects/:projectId',
